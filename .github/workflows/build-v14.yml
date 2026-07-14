@@ -1,0 +1,115 @@
+name: Build N-Life v1.4 APK
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build-apk:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - name: Set up Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+
+      - name: Extract N-Life v1.4 project
+        run: |
+          rm -rf extracted
+          mkdir extracted
+          ZIP_FILE=$(ls *nlife_v1_4*.zip 2>/dev/null | sort | head -n 1)
+          echo "Using ZIP: $ZIP_FILE"
+          unzip -q "$ZIP_FILE" -d extracted
+          PROJECT_DIR=$(dirname "$(find extracted -name pubspec.yaml -print -quit)")
+          echo "PROJECT_DIR=$PROJECT_DIR" >> $GITHUB_ENV
+          echo "Project folder: $PROJECT_DIR"
+
+      - name: Create Android platform files
+        run: |
+          cd "$PROJECT_DIR"
+          flutter create --platforms=android --project-name n_life .
+
+      - name: Apply N-Life native Android features
+        run: |
+          cd "$PROJECT_DIR"
+
+          sed -i 's/android:label="[^"]*"/android:label="N-Life"/g' android/app/src/main/AndroidManifest.xml
+
+          if [ -d android_icons ]; then
+            cp -R android_icons/* android/app/src/main/res/
+          fi
+
+          if [ -d android_widget ]; then
+            mkdir -p android/app/src/main/kotlin/com/example/n_life
+            cp android_widget/MainActivity.kt android/app/src/main/kotlin/com/example/n_life/MainActivity.kt
+            cp android_widget/NLifeWidgetProvider.kt android/app/src/main/kotlin/com/example/n_life/NLifeWidgetProvider.kt
+            cp android_widget/NLifeReminderReceiver.kt android/app/src/main/kotlin/com/example/n_life/NLifeReminderReceiver.kt
+            mkdir -p android/app/src/main/res/layout android/app/src/main/res/xml android/app/src/main/res/drawable
+            cp android_widget/nlife_widget.xml android/app/src/main/res/layout/nlife_widget.xml
+            cp android_widget/nlife_widget_info.xml android/app/src/main/res/xml/nlife_widget_info.xml
+            cp android_widget/nlife_widget_bg.xml android/app/src/main/res/drawable/nlife_widget_bg.xml
+          fi
+
+          python3 - <<'PY'
+          from pathlib import Path
+          path = Path('android/app/src/main/AndroidManifest.xml')
+          text = path.read_text()
+
+          for perm in [
+              '<uses-permission android:name="android.permission.POST_NOTIFICATIONS" />',
+              '<uses-permission android:name="android.permission.WAKE_LOCK" />',
+          ]:
+              if perm not in text:
+                  text = text.replace('<application', f'    {perm}\n    <application', 1)
+
+          widget_receiver = '''
+                  <receiver android:name="com.example.n_life.NLifeWidgetProvider" android:label="N-Life Duty Widget" android:enabled="true" android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.appwidget.action.APPWIDGET_UPDATE" />
+                      </intent-filter>
+                      <meta-data android:name="android.appwidget.provider" android:resource="@xml/nlife_widget_info" />
+                  </receiver>
+          '''
+
+          reminder_receiver = '''
+                  <receiver android:name="com.example.n_life.NLifeReminderReceiver" android:enabled="true" android:exported="false" />
+          '''
+
+          if 'NLifeWidgetProvider' not in text:
+              text = text.replace('</application>', widget_receiver + '\n    </application>')
+
+          if 'NLifeReminderReceiver' not in text:
+              text = text.replace('</application>', reminder_receiver + '\n    </application>')
+
+          path.write_text(text)
+          PY
+
+          if [ -f android_signing/nlife_debug.keystore ]; then
+            mkdir -p "$HOME/.android"
+            cp android_signing/nlife_debug.keystore "$HOME/.android/debug.keystore"
+          fi
+
+      - name: Get packages
+        run: |
+          cd "$PROJECT_DIR"
+          flutter pub get
+
+      - name: Build N-Life v1.4 APK
+        run: |
+          cd "$PROJECT_DIR"
+          flutter build apk --debug
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: N-Life-v1.4-update-apk
+          path: ${{ env.PROJECT_DIR }}/build/app/outputs/flutter-apk/app-debug.apk
