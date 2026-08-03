@@ -1,0 +1,192 @@
+name: Build N-Life v1.5.3 Robust PDF Fix APK
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build-apk:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - name: Set up Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+
+      - name: Extract exact N-Life v1.5 baseline
+        run: |
+          rm -rf extracted
+          mkdir extracted
+          ZIP_FILE="N-Life_v1.5_fresh-baseline_fixed-update.zip"
+          test -f "$ZIP_FILE" || { echo "Missing $ZIP_FILE"; exit 1; }
+          echo "Using ZIP: $ZIP_FILE"
+          unzip -q "$ZIP_FILE" -d extracted
+          PROJECT_DIR=$(dirname "$(find extracted -name pubspec.yaml -print -quit)")
+          test -n "$PROJECT_DIR" || { echo "pubspec.yaml not found"; exit 1; }
+          echo "PROJECT_DIR=$PROJECT_DIR" >> "$GITHUB_ENV"
+          echo "Project folder: $PROJECT_DIR"
+
+      - name: Create stable Android project
+        run: |
+          cd "$PROJECT_DIR"
+          flutter create --platforms=android --org com.example --project-name n_life .
+          rm -rf test
+
+      - name: Apply robust SPMS PDF compatibility fix
+        run: |
+          cd "$PROJECT_DIR"
+          python3 - <<'PY'
+          from pathlib import Path
+
+          main = Path('lib/main.dart')
+          lines = main.read_text().splitlines()
+
+          targets = {
+              92: 'pw.Image(assets.header',
+              70: 'pw.Image(assets.building',
+              38: 'pw.Image(assets.footer',
+          }
+          fixed = []
+
+          for height, image_marker in targets.items():
+              height_index = next(
+                  (i for i, line in enumerate(lines)
+                   if line.strip() == f'height: {height},'
+                   and any('pw.Positioned(' in lines[j] for j in range(max(0, i - 8), i))),
+                  None,
+              )
+              if height_index is None:
+                  raise SystemExit(f'Could not find Positioned height {height}.')
+
+              child_index = next(
+                  (i for i in range(height_index + 1, min(len(lines), height_index + 5))
+                   if image_marker in lines[i]),
+                  None,
+              )
+              if child_index is None:
+                  raise SystemExit(f'Could not find image child for height {height}.')
+
+              indent = lines[height_index][:len(lines[height_index]) - len(lines[height_index].lstrip())]
+              child_expression = lines[child_index].strip()
+              replacement = [
+                  f'{indent}child: pw.SizedBox(',
+                  f'{indent}  height: {height},',
+                  f'{indent}  child: {child_expression[len("child: "):]}',
+                  f'{indent}),',
+              ]
+              lines[height_index:child_index + 1] = replacement
+              fixed.append(height)
+
+          text = '\n'.join(lines) + '\n'
+          main.write_text(text)
+
+          # Update app version for a clean, incremented build.
+          pubspec = Path('pubspec.yaml')
+          p_lines = pubspec.read_text().splitlines()
+          for i, line in enumerate(p_lines):
+              if line.startswith('version:'):
+                  p_lines[i] = 'version: 1.5.3+153'
+                  break
+          else:
+              p_lines.append('version: 1.5.3+153')
+          pubspec.write_text('\n'.join(p_lines) + '\n')
+
+          # Verify the unsupported parameters are gone from the target Positioned blocks.
+          updated = main.read_text()
+          for height in (92, 70, 38):
+              if f'child: pw.SizedBox(\n              height: {height},' not in updated and f'height: {height},' not in updated:
+                  raise SystemExit(f'Expected SizedBox height {height} was not written.')
+          print('Fixed SPMS PDF image blocks:', fixed)
+          PY
+
+          echo "Patched SPMS PDF blocks:"
+          grep -n -A7 -B4 "assets.header\|assets.building\|assets.footer" lib/main.dart | head -80
+
+      - name: Apply app identity, native notifications, widget, and fixed signing
+        run: |
+          cd "$PROJECT_DIR"
+
+          sed -i 's/android:label="[^"]*"/android:label="N-Life"/g' android/app/src/main/AndroidManifest.xml
+
+          if [ -d android_icons ]; then
+            cp -R android_icons/* android/app/src/main/res/
+          fi
+
+          mkdir -p android/app/src/main/kotlin/com/example/n_life
+          cp android_widget/MainActivity.kt android/app/src/main/kotlin/com/example/n_life/MainActivity.kt
+          cp android_widget/NLifeWidgetProvider.kt android/app/src/main/kotlin/com/example/n_life/NLifeWidgetProvider.kt
+          cp android_widget/NLifeReminderReceiver.kt android/app/src/main/kotlin/com/example/n_life/NLifeReminderReceiver.kt
+          mkdir -p android/app/src/main/res/layout android/app/src/main/res/xml android/app/src/main/res/drawable
+          cp android_widget/nlife_widget.xml android/app/src/main/res/layout/nlife_widget.xml
+          cp android_widget/nlife_widget_info.xml android/app/src/main/res/xml/nlife_widget_info.xml
+          cp android_widget/nlife_widget_bg.xml android/app/src/main/res/drawable/nlife_widget_bg.xml
+
+          python3 - <<'PY'
+          from pathlib import Path
+
+          path = Path('android/app/src/main/AndroidManifest.xml')
+          text = path.read_text()
+
+          for perm in [
+              '<uses-permission android:name="android.permission.POST_NOTIFICATIONS" />',
+              '<uses-permission android:name="android.permission.WAKE_LOCK" />',
+              '<uses-permission android:name="android.permission.SCHEDULE_EXACT_ALARM" />',
+              '<uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />',
+          ]:
+              if perm not in text:
+                  text = text.replace('<application', f'    {perm}\n    <application', 1)
+
+          widget = '''
+                  <receiver android:name="com.example.n_life.NLifeWidgetProvider" android:label="N-Life Duty Widget" android:enabled="true" android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.appwidget.action.APPWIDGET_UPDATE" />
+                      </intent-filter>
+                      <meta-data android:name="android.appwidget.provider" android:resource="@xml/nlife_widget_info" />
+                  </receiver>
+          '''
+
+          reminder = '''
+                  <receiver android:name="com.example.n_life.NLifeReminderReceiver" android:enabled="true" android:exported="false" />
+          '''
+
+          if 'NLifeWidgetProvider' not in text:
+              text = text.replace('</application>', widget + '\n    </application>')
+          if 'NLifeReminderReceiver' not in text:
+              text = text.replace('</application>', reminder + '\n    </application>')
+
+          path.write_text(text)
+          PY
+
+          mkdir -p "$HOME/.android"
+          cp android_signing/nlife_fixed_debug.keystore "$HOME/.android/debug.keystore"
+
+      - name: Get Flutter packages
+        run: |
+          cd "$PROJECT_DIR"
+          flutter pub get
+
+      - name: Check app source
+        continue-on-error: true
+        run: |
+          cd "$PROJECT_DIR"
+          flutter analyze lib --no-fatal-infos
+
+      - name: Build N-Life v1.5.3 APK
+        run: |
+          cd "$PROJECT_DIR"
+          flutter build apk --debug
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: N-Life-v1.5.3-robust-pdf-fix-apk
+          path: ${{ env.PROJECT_DIR }}/build/app/outputs/flutter-apk/app-debug.apk
